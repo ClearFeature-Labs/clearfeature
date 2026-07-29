@@ -1,0 +1,77 @@
+{
+  "user_000002": {
+    "application_id": "app_000002",
+    "features": {
+      "affordability_index": 0.161084,
+      "combined_risk_index": 0.518458,
+      "existing_payment_to_income": 0.624541,
+      "income_stability_index": 0.85397,
+      "recent_delinquency_flag": 0,
+      "requested_monthly_payment": 233.333333,
+      "thin_file_flag": 0,
+      "total_payment_to_income": 0.81137
+    },
+    "pd_score": 0.292573,
+    "segment": "HIGH_RISK"
+  },
+  "user_000005": {
+    "application_id": "app_000005",
+    "features": {
+      "affordability_index": 0.708059,
+      "combined_risk_index": 0.172425,
+      "existing_payment_to_income": 0.056247,
+      "income_stability_index": 0.915686,
+      "recent_delinquency_flag": 0,
+      "requested_monthly_payment": 1212.5,
+      "thin_file_flag": 0,
+      "total_payment_to_income": 0.226745
+    },
+    "pd_score": 0.013949,
+    "segment": "LOW_RISK"
+  },
+  "user_000011": {
+    "application_id": "app_000011",
+    "features": {
+      "affordability_index": 0.214125,
+      "combined_risk_index": 0.460301,
+      "existing_payment_to_income": 0.33888,
+      "income_stability_index": 0.412987,
+      "recent_delinquency_flag": 0,
+      "requested_monthly_payment": 330.0,
+      "thin_file_flag": 0,
+      "total_payment_to_income": 0.481522
+    },
+    "pd_score": 0.142056,
+    "segment": "UNSTABLE_INCOME"
+  },
+  "user_000014": {
+    "application_id": "app_000014",
+    "features": {
+      "affordability_index": 0.303759,
+      "combined_risk_index": 0.675848,
+      "existing_payment_to_income": 0.412533,
+      "income_stability_index": 0.68278,
+      "recent_delinquency_flag": 1,
+      "requested_monthly_payment": 675.0,
+      "thin_file_flag": 0,
+      "total_payment_to_income": 0.555114
+    },
+    "pd_score": 0.39496,
+    "segment": "RECENT_DELINQUENCY"
+  },
+  "user_000055": {
+    "application_id": "app_000055",
+    "features": {
+      "affordability_index": 0.614161,
+      "combined_risk_index": 0.334101,
+      "existing_payment_to_income": 0.0,
+      "income_stability_index": 0.685152,
+      "recent_delinquency_flag": 0,
+      "requested_monthly_payment": 125.0,
+      "thin_file_flag": 1,
+      "total_payment_to_income": 0.103613
+    },
+    "pd_score": 0.036298,
+    "segment": "THIN_FILE"
+  }
+}

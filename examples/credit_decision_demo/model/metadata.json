@@ -1,0 +1,17 @@
+{
+  "digest": "sha256:6e1a727e9d5887487a94026a369335f75263cea82d9a3bc352d2f8567b0dc7ab",
+  "metrics": {
+    "baseline_bureau_score_only": {
+      "brier": 0.102799,
+      "log_loss": 0.339643,
+      "roc_auc": 0.784223
+    },
+    "holdout_default_rate": 0.138,
+    "holdout_size": 500,
+    "model": {
+      "brier": 0.093134,
+      "log_loss": 0.307514,
+      "roc_auc": 0.843472
+    }
+  }
+}

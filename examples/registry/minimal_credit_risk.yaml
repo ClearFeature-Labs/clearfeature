@@ -1,0 +1,82 @@
+# Minimal example registry for the FinTech Feature Platform MVP.
+#
+# UDF-only on purpose: model nodes (e.g. pd_score) and feature `checks` blocks
+# are not supported by the loader yet and are intentionally omitted here.
+
+registry_version: "example-v1"
+
+entities:
+  application:
+    key_fields: ["user_id", "application_id"]
+
+sources:
+  credit_report:
+    type: "raw_report"
+    report_type: "credit_report"
+    ts_field: "report_ts"
+
+  tax_report:
+    type: "raw_report"
+    report_type: "tax_report"
+    ts_field: "report_ts"
+
+feature_views:
+  user_credit_risk:
+    entity: "application"
+    key_fields: ["user_id", "application_id"]
+    view_version: 1
+    owner: "risk_team"
+    status: "active"
+
+    features:
+      declared_income:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit.declared_income"
+        inputs: ["credit_report"]
+        dtype: "decimal"
+        status: "active"
+        description: "Declared income extracted from the credit report."
+
+      monthly_obligations:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit.monthly_obligations"
+        inputs: ["credit_report"]
+        dtype: "decimal"
+        status: "active"
+
+      income_from_tax:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.tax.income"
+        inputs: ["tax_report"]
+        dtype: "decimal"
+        status: "active"
+
+      debt_to_income_ratio:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.common.safe_ratio"
+        deps: ["monthly_obligations", "income_from_tax"]
+        dtype: "float"
+        status: "active"
+
+      # Externally computed model output, written back via POST /v1/model-scores.
+      # It is NOT computed by ComputeCore (no udf/inputs/deps).
+      pd_score:
+        kind: "model_score"
+        feature_version: 1
+        dtype: "float"
+        status: "active"
+        description: "Probability-of-default score written by an external PD model."
+
+    # Logical groups: a caller can request a group name and the Feature Planner
+    # expands it to these explicit output features.
+    feature_groups:
+      pd_model_input_v1:
+        - declared_income
+        - debt_to_income_ratio
+      affordability_input_v1:
+        - declared_income
+        - monthly_obligations

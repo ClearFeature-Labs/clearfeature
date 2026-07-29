@@ -1,0 +1,29 @@
+# Keep the image lean: only pyproject/uv.lock, src/, examples/, infra/, README go in.
+.git
+.gitignore
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.env
+.env.*
+!.env.example
+.fsp
+.DS_Store
+**/.DS_Store
+
+# Not needed at runtime.
+tests/
+docs/
+tasks/
+rules/
+ci/
+scripts/
+Makefile
+docker-compose.yml
+Dockerfile
+.dockerignore
+AGENTS.md
+CLAUDE.md

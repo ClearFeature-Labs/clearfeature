@@ -1,0 +1,367 @@
+# Production-light Docker Compose baseline  — staging / serious dev.
+# NOT HA production: single-node stateful services. See docs/deployment/docker_compose.md
+# for connection rules, persistence, and the Kubernetes/on-prem migration path.
+#
+# The message broker is REDPANDA (redpandadata/redpanda). It speaks the Kafka-compatible
+# API — i.e. standard Kafka clients, topics and consumer groups talk to it — so the
+# FSP_KAFKA_* settings and the `topic-init` initializer use the Kafka protocol against
+# Redpanda. There is no Apache Kafka container and no second broker.
+#
+# Connection rules:
+#   containers -> service names:  postgres:5432, valkey:6379, minio:9000, redpanda:19092
+#   host tools -> localhost ports (all host bindings are 127.0.0.1-only)
+#   Broker: internal listener advertises redpanda:19092 (containers);
+#           external listener advertises localhost:${REDPANDA_KAFKA_PORT:-19092} (host).
+
+name: fsp-dev
+
+x-common: &common
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 60s
+  networks:
+    - fsp
+  logging:
+    driver: json-file
+    options:
+      max-size: "100m"
+      max-file: "5"
+
+# Real FSP_* settings (api/settings.py) pointing at Docker-network addresses.
+x-app-env: &app-env
+  FSP_BACKEND: local
+  FSP_EVENTS: kafka
+  # Registry seam : empty -> the built-in demo registry. Set both to serve a
+  # different feature contract (the image ships examples/), e.g. the credit demo:
+  #   FSP_REGISTRY_PATH=examples/credit_decision_demo/registry/credit_decision_v1.yaml
+  #   FSP_UDF_PROVIDER=examples.credit_decision_demo.features:build_registry_and_udfs
+  FSP_REGISTRY_PATH: ${FSP_REGISTRY_PATH:-}
+  FSP_UDF_PROVIDER: ${FSP_UDF_PROVIDER:-}
+  FSP_POSTGRES_DSN: postgresql://${POSTGRES_USER:-fsp}:${POSTGRES_PASSWORD:-fsp_dev_password}@postgres:5432/${POSTGRES_DB:-fsp}
+  FSP_MINIO_ENDPOINT: minio:9000
+  FSP_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+  FSP_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+  FSP_MINIO_BUCKET: ${FSP_MINIO_BUCKET:-raw-reports}
+  FSP_VALKEY_HOST: valkey
+  FSP_VALKEY_PORT: "6379"
+  FSP_KAFKA_BOOTSTRAP_SERVERS: redpanda:19092
+  # Read by the one-shot topic-init service only : canonical fp.* topics
+  # are provisioned grow-only before any worker consumes. RF must stay 1 on one broker.
+  FSP_KAFKA_TOPIC_PARTITIONS: ${FSP_KAFKA_TOPIC_PARTITIONS:-4}
+  FSP_KAFKA_REPLICATION_FACTOR: ${FSP_KAFKA_REPLICATION_FACTOR:-1}
+  # Per-process observability server : serves /metrics + /ready on
+  # this INTERNAL port in every app process. 0 (default) = disabled — unchanged
+  # behavior; set once to enable readiness probing/scraping across all services. No
+  # host port is published. Legacy FSP_METRICS_PORT is honored as a fallback in code.
+  FSP_OBSERVABILITY_PORT: ${FSP_OBSERVABILITY_PORT:-0}
+
+# One image for API + workers; each service only overrides `command`.
+x-app: &app
+  <<: *common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: fsp-app:latest
+  environment: *app-env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    valkey:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+    redpanda:
+      condition: service_healthy
+    # No worker/API may start consuming before topics exist with the right partitions.
+    topic-init:
+      condition: service_completed_successfully
+  deploy:
+    resources:
+      limits:
+        cpus: "1"
+        memory: 512M
+      reservations:
+        cpus: "0.25"
+        memory: 256M
+
+services:
+  postgres:
+    <<: *common
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fsp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fsp_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-fsp}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Schemas 001..008 auto-apply on FIRST init of an empty volume (filename order).
+      # Later migrations on an existing volume are applied manually with psql.
+      - ./infra/postgres:/docker-entrypoint-initdb.d:ro
+    shm_size: "512mb"
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-100}
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-1GB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-128MB}
+      - -c
+      - wal_compression=on
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  valkey:
+    <<: *common
+    image: valkey/valkey:8.1-bookworm
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - ${VALKEY_MAXMEMORY:-512mb}
+      # Online features must fail loudly rather than silently evict (D9 store).
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "127.0.0.1:${VALKEY_PORT:-6379}:6379"
+    volumes:
+      - valkeydata:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  minio:
+    <<: *common
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+
+  redpanda:
+    <<: *common
+    image: redpandadata/redpanda:v25.3.15
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=${REDPANDA_SMP:-1}
+      - --default-log-level=warn
+      # Two listeners: containers use the internal one (advertised as redpanda:19092),
+      # host tools use the external one (advertised as localhost:$REDPANDA_KAFKA_PORT).
+      # Advertising localhost to containers would break every in-network consumer.
+      - --kafka-addr=internal://0.0.0.0:19092,external://0.0.0.0:9092
+      - --advertise-kafka-addr=internal://redpanda:19092,external://localhost:${REDPANDA_KAFKA_PORT:-19092}
+    ports:
+      - "127.0.0.1:${REDPANDA_KAFKA_PORT:-19092}:9092"
+    volumes:
+      - redpandadata:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
+
+  # --- application (one image, command per service) ---------------------------
+
+  # One-shot topic provisioning : creates/expands the canonical
+  # fp.* topics on Redpanda (via the Kafka admin API), exits 0, and gates every app
+  # service via service_completed_successfully. Renamed from `kafka-init` in Task
+  # so the operator-facing name reflects what it does (initialize topics) and
+  # does not read like a second broker next to `redpanda`. The runner module
+  # (`api.kafka_init_runner`) keeps its name: it legitimately uses the Kafka admin
+  # protocol. Deliberately NOT *app (that anchor would make it depend on itself).
+  # Rerun manually with: bash scripts/create_kafka_topics.sh
+  topic-init:
+    <<: *common
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fsp-app:latest
+    restart: "no"
+    environment: *app-env
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    command: ["python", "-m", "fintech_feature_platform.api.kafka_init_runner"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  api:
+    <<: *app
+    environment:
+      # DB pool budgets per runtime; 0 would restore per-op connections.
+      <<: *app-env
+      FSP_DB_POOL_SIZE: "10"
+      #: fail-closed API-key auth. api_key mode refuses to start without
+      # FSP_API_KEYS; the ONLY bypass is FSP_SECURITY_MODE=disabled with
+      # FSP_ENVIRONMENT=development. Keys: docs/security/minimum_security.md.
+      FSP_SECURITY_MODE: ${FSP_SECURITY_MODE:-api_key}
+      FSP_ENVIRONMENT: ${FSP_ENVIRONMENT:-development}
+      FSP_API_KEYS: ${FSP_API_KEYS:-}
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  online-worker:
+    <<: *app
+    environment:
+      <<: *app-env
+      FSP_DB_POOL_SIZE: "2"
+    command: ["python", "-m", "fintech_feature_platform.api.online_worker_runner", "--forever"]
+
+  offline-writer:
+    <<: *app
+    environment:
+      <<: *app-env
+      FSP_DB_POOL_SIZE: "4"
+    command: ["python", "-m", "fintech_feature_platform.api.offline_writer_runner", "--forever"]
+
+  metadata-writer:
+    <<: *app
+    environment:
+      <<: *app-env
+      FSP_DB_POOL_SIZE: "4"
+    command: ["python", "-m", "fintech_feature_platform.api.metadata_writer_runner", "--forever"]
+
+  model-score-writer:
+    <<: *app
+    environment:
+      <<: *app-env
+      FSP_DB_POOL_SIZE: "2"
+    command: ["python", "-m", "fintech_feature_platform.api.model_score_writer_runner", "--forever"]
+
+  batch-worker:
+    <<: *app
+    environment:
+      <<: *app-env
+      FSP_DB_POOL_SIZE: "4"
+    command: ["python", "-m", "fintech_feature_platform.api.batch_worker_runner", "--forever"]
+
+  propagation-worker:
+    <<: *app
+    environment:
+      <<: *app-env
+      FSP_DB_POOL_SIZE: "2"
+    command: ["python", "-m", "fintech_feature_platform.api.propagation_worker_runner", "--forever"]
+
+  # Demo-only : external credit-decision scorer. Starts ONLY with
+  # `--profile demo`. Depends on the Feature API contract alone — deliberately gets NO
+  # store/broker credentials (no *app-env): it must never touch Postgres/Valkey/MinIO/
+  # Kafka directly. Same image; same committed model artifact as batch F3.
+  demo-model-service:
+    <<: *common
+    profiles: ["demo"]
+    image: fsp-app:latest
+    environment:
+      FSP_FEATURE_API_URL: http://api:8000
+      FSP_REGISTRY_PATH: ${FSP_REGISTRY_PATH:-examples/credit_decision_demo/registry/credit_decision_v1.yaml}
+      #: this service has its OWN accepted-key registry (a Feature API key
+      # grants nothing here) and presents its OWN service-role key upstream.
+      FSP_SECURITY_MODE: ${FSP_SECURITY_MODE:-api_key}
+      FSP_ENVIRONMENT: ${FSP_ENVIRONMENT:-development}
+      FSP_API_KEYS: ${FSP_MODEL_SERVICE_API_KEYS:-}
+      FSP_FEATURE_API_KEY: ${FSP_FEATURE_API_KEY:-}
+      # Demo-only: include the synthetic input vector in decision responses.
+      FSP_DECISION_INCLUDE_FEATURES: ${FSP_DECISION_INCLUDE_FEATURES:-0}
+    command: ["uvicorn", "examples.credit_decision_demo.model_service:app",
+              "--host", "0.0.0.0", "--port", "8090"]
+    ports:
+      - "127.0.0.1:${MODEL_SERVICE_PORT:-8090}:8090"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+networks:
+  fsp:
+    driver: bridge
+
+volumes:
+  pgdata:
+  valkeydata:
+  miniodata:
+  redpandadata:

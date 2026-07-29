@@ -1,0 +1,347 @@
+# Credit-decision demo feature contract  — SYNTHETIC showcase, not for real
+# lending. One view (the platform requires F2 deps within one view); the five F1 source
+# groupings are feature_groups, so manifest-scoped batch jobs compute one source at a time.
+# F2 edges are `lazy` (the nightly batch is the recompute trigger); depth 4 needs the
+# explicit max_dependency_depth override (default cap is 3, hard cap 5).
+
+registry_version: "credit-decision-demo-v1"
+
+entities:
+  application:
+    key_fields: ["user_id", "application_id"]
+
+sources:
+  application_request:
+    type: "raw_report"
+    report_type: "application_request"
+    ts_field: "application_ts"
+  tax_report:
+    type: "raw_report"
+    report_type: "tax_report"
+    ts_field: "report_ts"
+  credit_bureau_report:
+    type: "raw_report"
+    report_type: "credit_bureau_report"
+    ts_field: "report_ts"
+  telco_report:
+    type: "raw_report"
+    report_type: "telco_report"
+    ts_field: "report_ts"
+  socdem_report:
+    type: "raw_report"
+    report_type: "socdem_report"
+    ts_field: "report_ts"
+
+feature_views:
+  credit_decision:
+    entity: "application"
+    key_fields: ["user_id", "application_id"]
+    view_version: 1
+    owner: "credit_demo"
+    status: "live"
+    max_dependency_depth: 4
+
+    features:
+      # --- F1: application request (not an external report) ---
+      requested_amount:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.requested_amount"
+        inputs: ["application_request"]
+        dtype: "int"
+        status: "live"
+      term_months:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.term_months"
+        inputs: ["application_request"]
+        dtype: "int"
+        status: "live"
+
+      # --- F1: tax / income (12 monthly periods) ---
+      income_avg_3m:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.income_avg_3m"
+        inputs: ["tax_report"]
+        dtype: "float"
+        status: "live"
+      income_avg_6m:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.income_avg_6m"
+        inputs: ["tax_report"]
+        dtype: "float"
+        status: "live"
+      income_avg_12m:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.income_avg_12m"
+        inputs: ["tax_report"]
+        dtype: "float"
+        status: "live"
+      income_std_12m:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.income_std_12m"
+        inputs: ["tax_report"]
+        dtype: "float"
+        status: "live"
+      income_trend_6m:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.income_trend_6m"
+        inputs: ["tax_report"]
+        dtype: "float"
+        status: "live"
+      months_with_income_12m:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.months_with_income_12m"
+        inputs: ["tax_report"]
+        dtype: "int"
+        status: "live"
+
+      # --- F1: credit bureau ---
+      bureau_score:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.bureau_score"
+        inputs: ["credit_bureau_report"]
+        dtype: "int"
+        status: "live"
+      active_loans_count:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.active_loans_count"
+        inputs: ["credit_bureau_report"]
+        dtype: "int"
+        status: "live"
+      total_outstanding_amount:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.total_outstanding_amount"
+        inputs: ["credit_bureau_report"]
+        dtype: "int"
+        status: "live"
+      total_monthly_debt_payment:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.total_monthly_debt_payment"
+        inputs: ["credit_bureau_report"]
+        dtype: "int"
+        status: "live"
+      max_dpd_12m:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.max_dpd_12m"
+        inputs: ["credit_bureau_report"]
+        dtype: "int"
+        status: "live"
+      days_since_last_delinquency:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.days_since_last_delinquency"
+        inputs: ["credit_bureau_report"]
+        dtype: "int"
+        status: "live"
+        description: "9999 = no delinquency on record."
+      inquiries_30d:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.inquiries_30d"
+        inputs: ["credit_bureau_report"]
+        dtype: "int"
+        status: "live"
+
+      # --- F1: telco ---
+      sim_age_days:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.sim_age_days"
+        inputs: ["telco_report"]
+        dtype: "int"
+        status: "live"
+      active_days_30d:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.active_days_30d"
+        inputs: ["telco_report"]
+        dtype: "int"
+        status: "live"
+      avg_monthly_topup:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.avg_monthly_topup"
+        inputs: ["telco_report"]
+        dtype: "int"
+        status: "live"
+      telco_score:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.telco_score"
+        inputs: ["telco_report"]
+        dtype: "int"
+        status: "live"
+
+      # --- F1: socdem ---
+      age:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.age"
+        inputs: ["socdem_report"]
+        dtype: "int"
+        status: "live"
+      region_code:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.region_code"
+        inputs: ["socdem_report"]
+        dtype: "string"
+        status: "live"
+      residence_tenure_months:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.residence_tenure_months"
+        inputs: ["socdem_report"]
+        dtype: "int"
+        status: "live"
+
+      # --- F2: credit affordability (real DAG; lazy edges — nightly batch recomputes) ---
+      requested_monthly_payment:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.requested_monthly_payment"
+        deps:
+          - {feature: requested_amount, version: 1}
+          - {feature: term_months, version: 1}
+        dtype: "float"
+        status: "live"
+      existing_payment_to_income:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.existing_payment_to_income"
+        deps:
+          - {feature: total_monthly_debt_payment, version: 1}
+          - {feature: income_avg_12m, version: 1}
+        dtype: "float"
+        status: "live"
+      total_payment_to_income:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.total_payment_to_income"
+        deps:
+          - {feature: requested_monthly_payment, version: 1}
+          - {feature: total_monthly_debt_payment, version: 1}
+          - {feature: income_avg_12m, version: 1}
+        dtype: "float"
+        status: "live"
+      income_stability_index:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.income_stability_index"
+        deps:
+          - {feature: income_avg_12m, version: 1}
+          - {feature: income_std_12m, version: 1}
+          - {feature: months_with_income_12m, version: 1}
+        dtype: "float"
+        status: "live"
+      recent_delinquency_flag:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.recent_delinquency_flag"
+        deps:
+          - {feature: days_since_last_delinquency, version: 1}
+          - {feature: max_dpd_12m, version: 1}
+        dtype: "int"
+        status: "live"
+      thin_file_flag:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.thin_file_flag"
+        deps:
+          - {feature: active_loans_count, version: 1}
+          - {feature: sim_age_days, version: 1}
+        dtype: "int"
+        status: "live"
+      affordability_index:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.affordability_index"
+        deps:
+          - {feature: income_stability_index, version: 1}
+          - {feature: total_payment_to_income, version: 1}
+        dtype: "float"
+        status: "live"
+      combined_risk_index:
+        kind: "udf"
+        feature_version: 1
+        udf: "udf.credit_demo.combined_risk_index"
+        deps:
+          - {feature: affordability_index, version: 1}
+          - {feature: recent_delinquency_flag, version: 1}
+          - {feature: thin_file_flag, version: 1}
+          - {feature: bureau_score, version: 1}
+        dtype: "float"
+        status: "live"
+
+      # --- F3: PD model-as-feature (batch-only; digest pins model/artifact.json) ---
+      pd_score:
+        kind: "model"
+        feature_version: 1
+        dtype: "float"
+        status: "live"
+        deps:
+          - {feature: income_avg_12m, version: 1}
+          - {feature: income_stability_index, version: 1}
+          - {feature: bureau_score, version: 1}
+          - {feature: existing_payment_to_income, version: 1}
+          - {feature: total_payment_to_income, version: 1}
+          - {feature: recent_delinquency_flag, version: 1}
+          - {feature: thin_file_flag, version: 1}
+          - {feature: inquiries_30d, version: 1}
+          - {feature: telco_score, version: 1}
+          - {feature: affordability_index, version: 1}
+        model:
+          uri: "mlflow://credit_pd_demo/1"
+          digest: "sha256:6e1a727e9d5887487a94026a369335f75263cea82d9a3bc352d2f8567b0dc7ab"
+          output_name: "pd"
+          batch_only: true
+
+    feature_groups:
+      application_request_v1:
+        - requested_amount
+        - term_months
+      tax_income_v1:
+        - income_avg_3m
+        - income_avg_6m
+        - income_avg_12m
+        - income_std_12m
+        - income_trend_6m
+        - months_with_income_12m
+      bureau_risk_v1:
+        - bureau_score
+        - active_loans_count
+        - total_outstanding_amount
+        - total_monthly_debt_payment
+        - max_dpd_12m
+        - days_since_last_delinquency
+        - inquiries_30d
+      telco_profile_v1:
+        - sim_age_days
+        - active_days_30d
+        - avg_monthly_topup
+        - telco_score
+      socdem_profile_v1:
+        - age
+        - region_code
+        - residence_tenure_months
+      credit_affordability_v1:
+        - requested_monthly_payment
+        - existing_payment_to_income
+        - total_payment_to_income
+        - income_stability_index
+        - recent_delinquency_flag
+        - thin_file_flag
+        - affordability_index
+        - combined_risk_index

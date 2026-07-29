@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.whl
+
+# Environments
+.venv/
+venv/
+.python-version
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local runtime and service data
+.env
+.env.*
+!.env.example
+*.log
+data/
+volumes/
+.fsp/
+artifacts/
+*.pem
+*.key
+*.crt
+id_rsa*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Benchmarks / scratch
+bench_out/
+tmp/
+
+# Defense-in-depth: internal development material must never enter this repository
+AGENTS.md
+CLAUDE.md
+rules/
+tasks/
+docs/audit/
+docs/roadmap/
+docs/04_decisions/
+docs/05_progress.md
+docs/06_learning_log.md
+.release_private/
+
+# Generated demo datasets
+.demo-data/

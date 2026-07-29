@@ -1,0 +1,46 @@
+# Feature-registry CI (GitLab CI) — thin wrapper over fsctl.
+#
+# Placeholder template: runs the feature-as-code gates (validate + test) on every pipeline and
+# publishes an immutable bundle on the default branch / tags. It does NOT promote to live —
+# promotion to live is a separate, human-approved `fsctl promote` step run outside CI (bank
+# profile = 2 approvers + shadow soak). No business logic lives in this YAML.
+#
+# Replace the placeholders (REGISTRY_PATH, TESTS_PATH, BUNDLE_STORE) for your repo.
+
+variables:
+  REGISTRY_PATH: examples/registry/minimal_credit_risk.yaml
+  TESTS_PATH: examples/registry/golden_cases.yaml
+  BUNDLE_STORE: .fsp/bundles
+
+stages:
+  - validate
+  - test
+  - publish
+
+.fsp_setup: &fsp_setup
+  image: python:3.12-slim
+  before_script:
+    - pip install uv
+    - uv sync --extra dev
+
+fsctl-validate:
+  <<: *fsp_setup
+  stage: validate
+  script:
+    - uv run fsctl validate --registry "$REGISTRY_PATH"
+
+fsctl-test:
+  <<: *fsp_setup
+  stage: test
+  script:
+    - uv run fsctl test --registry "$REGISTRY_PATH" --tests "$TESTS_PATH"
+
+# Publish an immutable bundle only on the default branch / tags (never auto-promote to live).
+fsctl-publish:
+  <<: *fsp_setup
+  stage: publish
+  script:
+    - uv run fsctl publish --registry "$REGISTRY_PATH" --bundle-store "$BUNDLE_STORE"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'

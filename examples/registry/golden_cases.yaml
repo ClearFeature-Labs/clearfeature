@@ -1,0 +1,31 @@
+# Golden cases for the minimal_credit_risk demo registry.
+#
+# `fsctl test --registry minimal_credit_risk.yaml --tests golden_cases.yaml` runs each case
+# through the real ComputeCore + demo UDF provider and compares the output to expected.value.
+# `deps` supplies dependency (feature-ref) inputs; `sources` supplies raw-source payloads.
+
+cases:
+  - name: declared_income_from_source
+    feature: declared_income
+    sources:
+      credit_report:
+        declared_income: 5000
+        monthly_obligations: 900
+    expected:
+      value: 5000
+
+  - name: income_from_tax_source
+    feature: income_from_tax
+    sources:
+      tax_report:
+        income: 100
+    expected:
+      value: 100
+
+  - name: debt_to_income_ratio_smoke
+    feature: debt_to_income_ratio
+    deps:
+      monthly_obligations: 20
+      income_from_tax: 100
+    expected:
+      value: 0.2

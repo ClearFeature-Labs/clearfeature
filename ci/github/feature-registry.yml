@@ -1,0 +1,46 @@
+# Feature-registry CI (GitHub Actions) — thin wrapper over fsctl.
+#
+# This template is a placeholder: it runs the feature-as-code gates (validate + test) on every
+# PR and publishes an immutable bundle on the default branch / tags. It intentionally does NOT
+# promote to live — promotion to live is a separate, human-approved `fsctl promote` step run
+# outside CI (bank profile = 2 approvers + shadow soak). No business logic lives in this YAML.
+#
+# Replace the placeholders (REGISTRY_PATH, TESTS_PATH, BUNDLE_STORE) for your repo.
+
+name: feature-registry
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  REGISTRY_PATH: examples/registry/minimal_credit_risk.yaml
+  TESTS_PATH: examples/registry/golden_cases.yaml
+  BUNDLE_STORE: .fsp/bundles
+
+jobs:
+  feature-registry:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Sync dependencies
+        run: uv sync --extra dev
+
+      # Gate 1: registry is valid (lifecycle / DAG / F2 / F3) and has a stable bundle digest.
+      - name: fsctl validate
+        run: uv run fsctl validate --registry "$REGISTRY_PATH"
+
+      # Gate 2: feature logic is correct (real ComputeCore golden cases).
+      - name: fsctl test
+        run: uv run fsctl test --registry "$REGISTRY_PATH" --tests "$TESTS_PATH"
+
+      # Publish an immutable bundle only on the default branch / tags (never auto-promote).
+      - name: fsctl publish (main/tags only)
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+        run: uv run fsctl publish --registry "$REGISTRY_PATH" --bundle-store "$BUNDLE_STORE"

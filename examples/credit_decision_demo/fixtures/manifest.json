@@ -1,0 +1,22 @@
+{
+  "clients": 150,
+  "currency_code": "USD",
+  "default_rate": 0.2,
+  "files": {
+    "applications.jsonl": "sha256:ec2f17dcbc9b65fdb0669b77798b949ce41a8661eb6e78b773685ed55bbebcc8",
+    "credit_bureau_reports.jsonl": "sha256:7fea73395a89f5daf653e55331eadc2b38e1b3ad2e78f57d2bf0ba967b80b28e",
+    "socdem_reports.jsonl": "sha256:609a7b8366e05bfb76bbab70bb6f9389c930e1a2c817dd52893b68a488cb4dcb",
+    "tax_reports.jsonl": "sha256:160c12e1a311e9ca3fee3b14a958036d40c79fce5c0433d5c199c23336bc0f69",
+    "telco_reports.jsonl": "sha256:6d7959132b4d413f1a1cc9a6add3ede164ac3d7fdb0679a3f9223d0f8dfb5f76"
+  },
+  "generator_version": "credit-demo-gen-v1",
+  "note": "SYNTHETIC data for a platform demo; not suitable for real lending.",
+  "seed": 7,
+  "sources": [
+    "application_request",
+    "tax_report",
+    "credit_bureau_report",
+    "telco_report",
+    "socdem_report"
+  ]
+}
