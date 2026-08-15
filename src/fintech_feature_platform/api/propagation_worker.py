@@ -140,10 +140,24 @@ def execute_wave(
             f"{entry.dependent_feature}:v{entry.dependent_version}"
         )
         tally.entities.add(f"{entry.entity.entity_type}:{entry.entity.encoded()}")
-        entity_key = EntityKey(
-            tuple((name, value) for name, value in entry.entity.entity_key.items())
-        )
         view_def = find_view(backend.registry, entry.view, entry.view_version)
+        # Rebuild the entity key in the VIEW's canonical key_fields order.
+        # Event JSON is deterministic (sort_keys=True), so the consumed entity_key
+        # dict arrives ALPHABETIZED; offline rows are keyed in key_fields order.
+        # Building from dict order made get_pit miss every row for views whose
+        # key_fields are not alphabetical — silently skipping the whole wave.
+        try:
+            if view_def is not None:
+                entity_key = EntityKey.from_mapping(
+                    entry.entity.entity_key, key_order=view_def.key_fields
+                )
+            else:  # unknown view: keep the legacy construction; fails deterministically below
+                entity_key = EntityKey(
+                    tuple((name, value) for name, value in entry.entity.entity_key.items())
+                )
+        except (KeyError, TypeError, ValueError):  # malformed key vs view contract
+            tally.failed += 1
+            continue
         feature = None
         if view_def is not None:
             feature = next(

@@ -1,4 +1,4 @@
-"""Recompute-wave execution (offline-only child run)."""
+"""Recompute-wave execution (offline-only child run) — ."""
 
 import json
 from datetime import UTC, datetime
@@ -220,3 +220,106 @@ def test_wave_accounting_is_counts_only_no_values():
     })
     for forbidden in ("value", "payload", "object_key", "storage_uri", "sql"):
         assert forbidden not in blob
+
+
+# --- entity-key ordering regression ---------------------------------
+#
+# Event JSON is deterministic (sort_keys=True), so a consumed FeatureUpdated carries
+# its entity_key dict in ALPHABETICAL order. The wave must rebuild the EntityKey in
+# the registry view's key_fields order — never dict order — or every offline lookup
+# misses and the unit is silently skipped. Caught live by a view keyed
+# (user_id, application_id, report_id): alphabetical order differs.
+
+def _multikey_backend():
+    registry = build_registry({
+        "registry_version": "test-multikey-v1",
+        "entities": {"snap": {"key_fields": ["user_id", "application_id"]}},
+        "sources": {
+            "src": {"type": "raw_report", "report_type": "r", "ts_field": "report_ts"},
+        },
+        "feature_views": {
+            "v": {"entity": "snap", "key_fields": ["user_id", "application_id"],
+                  "view_version": 1, "owner": "o", "status": "active", "features": {
+                "a": {"kind": "udf", "feature_version": 1, "udf": "udf.a",
+                      "dtype": "int", "status": "active", "inputs": ["src"]},
+                "b": {"kind": "udf", "feature_version": 1, "udf": "udf.b",
+                      "dtype": "int", "status": "active", "inputs": ["src"]},
+                "c": {"kind": "udf", "feature_version": 1, "udf": "udf.c",
+                      "dtype": "int", "status": "active", "deps": [
+                          {"feature": "a", "version": 1, "propagation": "reactive"},
+                          {"feature": "b", "version": 1, "propagation": "reactive"}]},
+            }},
+        },
+    })
+    udfs = UdfRegistry({
+        "udf.a": lambda s, d: s["src"]["v"],
+        "udf.b": lambda s, d: s["src"]["v"],
+        "udf.c": lambda s, d: d["a"] + d["b"],
+    })
+    resolver = ReportResolver(InMemoryPayloadStore(), InMemoryMetaRepository())
+    offline = InMemoryOfflineStore()
+    store = FeatureStore(registry, udfs, resolver, offline, InMemoryOnlineStore())
+    return SimpleNamespace(
+        registry=registry, store=store, offline=offline,
+        online=InMemoryOnlineStore(), events=InMemoryEventPublisher(),
+    )
+
+
+def _multikey(user="u1", app="a1"):
+    # canonical order: user_id FIRST (non-alphabetical: 'u' sorts after 'a').
+    return EntityKey.from_mapping(
+        {"user_id": user, "application_id": app},
+        key_order=["user_id", "application_id"],
+    )
+
+
+def test_wave_computes_for_non_alphabetical_key_fields_after_json_round_trip():
+    backend = _multikey_backend()
+    key = _multikey()
+    for name, value in (("a", 3), ("b", 4)):
+        backend.offline.append("v", 1, FeatureResult(
+            ref=FeatureRef(name, 1), entity_key=key, value=value,
+            data_ts=_SEED_TS, calc_ts=_SEED_TS, max_input_data_ts=_SEED_TS,
+            input_fingerprint=f"fp_{name}", value_hash=value_hash(value),
+        ))
+    event = FeatureUpdated(
+        update_id="u_mk1", entity=EntityRef("snap", {"user_id": "u1", "application_id": "a1"}),
+        view="v", view_version=1, feature_name="a", feature_version=1,
+        data_ts=_SEED_TS, calc_ts=_SEED_TS, source="batch_worker", occurred_at=_SEED_TS,
+    )
+    # Faithful Kafka path: serialize + parse -> entity_key dict arrives alphabetized.
+    event = FeatureUpdated.from_json(event.to_json())
+    assert list(event.entity.entity_key) == ["application_id", "user_id"]  # the trap
+
+    debounce = DebounceStore()
+    handle_feature_updated(backend, debounce, event)
+    wave = execute_wave(backend, debounce, calc_ts=_WAVE_TS)
+
+    assert wave.planned == 1
+    assert wave.skipped == 0  # the bug made this 1 (silent skip)
+    assert wave.computed == 1
+    records = backend.offline.get(key, feature_name="c", feature_version=1)
+    assert [r.result.value for r in records] == [7]
+    # the appended row is keyed in CANONICAL key_fields order:
+    assert records[0].result.entity_key.encode() == "user_id=u1|application_id=a1"
+
+
+def test_wave_still_skips_when_dependency_truly_missing_multikey():
+    backend = _multikey_backend()
+    key = _multikey()
+    backend.offline.append("v", 1, FeatureResult(  # only 'a' exists; 'b' missing
+        ref=FeatureRef("a", 1), entity_key=key, value=3,
+        data_ts=_SEED_TS, calc_ts=_SEED_TS, max_input_data_ts=_SEED_TS,
+        input_fingerprint="fp_a", value_hash=value_hash(3),
+    ))
+    event = FeatureUpdated.from_json(FeatureUpdated(
+        update_id="u_mk2", entity=EntityRef("snap", {"user_id": "u1", "application_id": "a1"}),
+        view="v", view_version=1, feature_name="a", feature_version=1,
+        data_ts=_SEED_TS, calc_ts=_SEED_TS, source="batch_worker", occurred_at=_SEED_TS,
+    ).to_json())
+    debounce = DebounceStore()
+    handle_feature_updated(backend, debounce, event)
+    wave = execute_wave(backend, debounce, calc_ts=_WAVE_TS)
+    assert wave.planned == 1
+    assert wave.skipped == 1  # genuine missing dep still skips (semantics unchanged)
+    assert wave.computed == 0

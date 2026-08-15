@@ -11,8 +11,8 @@ Endpoints: the Kafka-first request API (``POST /v1/feature-requests``,
 ``/v1/feature-requests/compute``, ``GET /v1/feature-requests/{request_id}``) plus the
 read APIs (``/v1/features/latest``, ``history``, ``consistency-check``,
 ``training-datasets/build``). The legacy synchronous compute routes were removed: the
-report_ref subsystem (``/v1/raw-reports`` + ``/v1/features/compute``) in and
-``/v1/features/compute-direct`` in. Online compute is Kafka-first only.
+report_ref subsystem (``/v1/raw-reports`` + ``/v1/features/compute``) in  and
+``/v1/features/compute-direct`` in . Online compute is Kafka-first only.
 
 Run the server with:
 
@@ -261,10 +261,14 @@ class BatchItemIn(BaseModel):
 
 
 class BatchScopeIn(BaseModel):
-    type: str  # "inline" | "source_dataset_manifest"
+    type: str  # "inline" | "source_dataset_manifest" | "source_dataset_manifests"
     items: list[BatchItemIn] = []           # inline scope
-    manifest_id: str | None = None          # source_dataset_manifest scope
+    manifest_id: str | None = None          # source_dataset_manifest scope (singular)
     include_duplicate_items: bool = False   # source_dataset_manifest scope
+    # Multi-manifest scope: several landed manifests joined by the COMPLETE
+    # canonical entity key into multi-source items. Refs-only through Kafka. Every raw
+    # source needed by the planned requested-output DAG is required per entity.
+    manifest_ids: list[str] | None = None
 
 
 class BatchJobIn(BaseModel):
@@ -286,7 +290,8 @@ class BatchJobResponse(BaseModel):
     status: str
     chunk_count: int
     total_items: int
-    manifest_id: str | None = None
+    manifest_id: str | None = None          # legacy singular field (unchanged)
+    manifest_ids: list[str] = []            # ALL input manifests
 
 
 class JsonlIngestIn(BaseModel):
@@ -425,7 +430,7 @@ def _submit_feature_request(
 
     Stores inline reports, publishes one self-contained ``FeatureComputeRequested`` to
     ``fp.feature-compute.online``, and initializes ``accepted`` status (best-effort).
-    Sets the absolute deadline : ``event_ts`` = accept time, ``expires_at`` =
+    Sets the absolute deadline: ``event_ts`` = accept time, ``expires_at`` =
     ``event_ts + clamp(deadline_ms)``. Never computes, never exposes
     ``object_key``/``storage_uri``.
     """
@@ -450,7 +455,7 @@ def _submit_feature_request(
     request_id = f"freq_{uuid4().hex}"
     job_id = f"job_{uuid4().hex}"
 
-    # Availability trust boundary : ordinary service-role requests can
+    # Availability trust boundary: ordinary service-role requests can
     # NEVER backdate availability — the API stamps its own accept time on every
     # descriptor. Trusted historical availability exists only on the operator
     # ingestion paths (JSONL/DWH rows, inline batch sources).
@@ -521,7 +526,7 @@ def _submit_feature_request(
         event_ts=event_ts,
         expires_at=expires_at,
     )
-    # Publish failure raises -> request is not reported as accepted.
+    # Publish failure raises -> request is not reported as accepted (ADR-0001).
     backend.events.publish(FEATURE_COMPUTE_ONLINE, entity.encoded(), event)
 
     # Best-effort: initialize request status. A status-store failure must NOT fail the
@@ -688,7 +693,7 @@ def _manifest_batch_items(backend: AppBackend, request: BatchJobIn):
     scope = request.scope
     if not scope.manifest_id:
         raise HTTPException(status_code=400, detail="scope.manifest_id is required")
-    # write_online=true is allowed ONLY as a guarded Mode-2 refresh : offline
+    # write_online=true is allowed ONLY as a guarded Mode-2 refresh: offline
     # stays primary, online refresh is token-bucketed + D9-guarded in the worker.
     if request.write_online and request.online_refresh_mode not in (None, "guarded"):
         raise HTTPException(
@@ -727,9 +732,224 @@ def _manifest_batch_items(backend: AppBackend, request: BatchJobIn):
     return batch_items, manifest.manifest_id
 
 
+def _batch_request_identity(
+    *,
+    view: str,
+    view_version: int,
+    requested_outputs: tuple[tuple[str, int], ...],
+    manifest_id: str | None,
+    manifest_ids: list[str],
+    write_online: bool,
+    online_refresh_mode: str | None,
+    total_items: int,
+    chunk_count: int,
+) -> tuple:
+    """Normalized identity of a batch request for idempotency-key enforcement.
+
+    Two submissions with the same ``idempotency_key`` are the same job only if this
+    tuple matches: scope category + manifest provenance, view identity, the
+    planner-EXPANDED requested outputs (so a group and its explicit member list are
+    the same request), the online write policy, and the realized chunking
+    (total_items, chunk_count). Input order of manifests/features never matters.
+    """
+    if manifest_id is not None:
+        scope_category = "source_dataset_manifest"
+        provenance: tuple[str, ...] = (manifest_id,)
+    elif manifest_ids:
+        scope_category = "source_dataset_manifests"
+        provenance = tuple(sorted(manifest_ids))
+    else:
+        scope_category = "inline"
+        provenance = ()
+    return (
+        scope_category,
+        provenance,
+        view,
+        view_version,
+        tuple(sorted(requested_outputs)),
+        write_online,
+        online_refresh_mode,
+        total_items,
+        chunk_count,
+    )
+
+
+def _existing_job_identity(backend: AppBackend, job) -> tuple | None:
+    """Identity of an already-accepted job, re-expanded against the current registry.
+
+    Returns None when the stored request no longer plans (registry drift) — the
+    caller treats that as a conflict, never as a silent match.
+    """
+    try:
+        view_def = _find_view(backend.registry, job.view, job.view_version)
+        plan = plan_features(
+            view_def, job.requested_features, job.requested_feature_groups
+        )
+    except (PlannerError, ValueError):
+        return None
+    return _batch_request_identity(
+        view=job.view,
+        view_version=job.view_version,
+        requested_outputs=tuple(
+            (ref.name, ref.version) for ref in plan.requested_outputs
+        ),
+        manifest_id=job.manifest_id,
+        manifest_ids=list(job.manifest_ids),
+        write_online=job.write_online,
+        online_refresh_mode=job.online_refresh_mode,
+        total_items=job.total_items,
+        chunk_count=job.chunk_count,
+    )
+
+
+def _multi_manifest_batch_items(
+    backend: AppBackend, request: BatchJobIn, view_def: FeatureViewDef
+) -> tuple[list[BatchItem], list[str]]:
+    """Join several landed manifests into multi-source batch items.
+
+    Contract: join by the COMPLETE canonical entity key in the
+    view's ``key_fields`` order (never a key subset, never report_ts); each source
+    binding keeps its own report_ref (stamps stay per-source in the worker); Kafka
+    stays refs-only; ambiguity (one entity+source bound to two DISTINCT refs across
+    the selected manifests) fails closed BEFORE publish with a bounded, values-free
+    400; exact duplicate bindings (same immutable ref, e.g. a re-ingestion manifest)
+    collapse safely. Every raw source the requested DAG loads is mandatory per
+    entity — enforced at compute time by the report resolver, which raises the
+    deterministic per-item error ``no report_ref bound for source '<name>'`` for an
+    entity missing one, so nothing is silently dropped, no nulls are fabricated,
+    and unaffected entities continue (the job may finish
+    ``completed_with_errors``). The joined item order is sorted by encoded entity
+    key, so items and chunking are deterministic regardless of ``manifest_ids``
+    input order.
+    """
+    scope = request.scope
+    if scope.include_duplicate_items:
+        # The multi-manifest join ALWAYS admits exact-duplicate re-ingested bindings
+        # (they collapse to one ref); a no-op true here would be a silent lie —
+        # reject explicitly before any job/publish.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "include_duplicate_items is not supported for scope "
+                "'source_dataset_manifests'; the multi-manifest join always "
+                "includes exact-duplicate re-ingested bindings"
+            ),
+        )
+    manifest_ids = list(scope.manifest_ids or [])
+    if not manifest_ids:
+        raise HTTPException(
+            status_code=400, detail="scope.manifest_ids is required (non-empty list)"
+        )
+    if len(set(manifest_ids)) != len(manifest_ids):
+        raise HTTPException(
+            status_code=400, detail="scope.manifest_ids contains duplicate manifest ids"
+        )
+    if request.write_online and request.online_refresh_mode not in (None, "guarded"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "manifest-scoped write_online requires online_refresh_mode='guarded' "
+                f"(got {request.online_refresh_mode!r})"
+            ),
+        )
+
+    # Manifest-level validation: all-or-nothing BEFORE any join or publish.
+    registered_sources = {source.name for source in backend.registry.sources}
+    manifests = []
+    for mid in sorted(manifest_ids):  # normalized processing order (not precedence)
+        manifest = backend.source_datasets.get_manifest(mid)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail=f"unknown manifest {mid!r}")
+        if manifest.landing_form != LANDING_RAW_REPORTS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"manifest {mid!r} landing_form {manifest.landing_form!r} is not "
+                    "computable by batch; feature-row datasets already live in "
+                    "offline history"
+                ),
+            )
+        if manifest.source_name not in registered_sources:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"manifest {mid!r} source {manifest.source_name!r} is not a "
+                    "registered raw source of this registry"
+                ),
+            )
+        manifests.append(manifest)
+    entity_types = {manifest.entity_type for manifest in manifests}
+    if len(entity_types) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "selected manifests disagree on entity_type: "
+                f"{sorted(entity_types)}"
+            ),
+        )
+
+    # Join by the COMPLETE canonical entity key (view key_fields order).
+    join: dict[str, dict[str, str]] = {}
+    key_parts: dict[str, dict[str, str]] = {}
+    ambiguous_bindings = 0
+    ambiguous_sources: set[str] = set()
+    eligible = {ITEM_WRITTEN, ITEM_DUPLICATE}
+    for manifest in manifests:
+        for item in backend.source_datasets.list_items(manifest.manifest_id):
+            if item.status not in eligible or not item.report_ref or not item.entity_key:
+                continue
+            try:
+                canonical = EntityKey.from_mapping(
+                    {name: item.entity_key[name] for name in view_def.key_fields},
+                    key_order=view_def.key_fields,
+                )
+            except (KeyError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"manifest {manifest.manifest_id!r} item entity_key does not "
+                        f"match view key_fields {list(view_def.key_fields)}"
+                    ),
+                ) from exc
+            encoded = canonical.encode()
+            bindings = join.setdefault(encoded, {})
+            existing = bindings.get(item.source_name)
+            if existing is None:
+                bindings[item.source_name] = item.report_ref
+                key_parts[encoded] = {
+                    name: item.entity_key[name] for name in view_def.key_fields
+                }
+            elif existing != item.report_ref:  # distinct refs -> ambiguous, fail closed
+                ambiguous_bindings += 1
+                ambiguous_sources.add(item.source_name)
+            # identical ref (exact duplicate / re-ingestion) collapses silently
+    if ambiguous_bindings:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "ambiguous_source_binding: "
+                f"{ambiguous_bindings} entity/source binding(s) resolve to more than "
+                f"one distinct report_ref across the selected manifests "
+                f"(sources: {sorted(ambiguous_sources)}); split the request or "
+                "re-ingest a corrected dataset"
+            ),
+        )
+
+    entity_type = manifests[0].entity_type
+    items = [
+        BatchItem(
+            entity_type=entity_type,
+            entity_key=key_parts[encoded],
+            source_refs=dict(join[encoded]),
+        )
+        for encoded in sorted(join)  # deterministic items + chunking
+    ]
+    return items, sorted(manifest_ids)
+
+
 ENDPOINT_POLICY: dict[str, str] = {
     "/health": PUBLIC,
-    # Readiness : bounded dependency categories only — no secrets,
+    # Readiness: bounded dependency categories only — no secrets,
     # no exception text — so orchestration can probe it unauthenticated, like /health.
     "/ready": PUBLIC,
     # data plane (service or operator)
@@ -757,7 +977,7 @@ def create_app(
     backend: AppBackend | None = None,
     security: SecurityConfig | None = None,
 ) -> FastAPI:
-    # Structured operational logging : one JSON event per line on the
+    # Structured operational logging: one JSON event per line on the
     # 'fsp' namespace logger. Uvicorn lifecycle/error output is re-routed through the
     # same JSON envelope (event=runtime_log) and its plaintext access log is dropped in
     # json mode (api_request_completed + Prometheus cover requests) — so service stdout
@@ -774,7 +994,7 @@ def create_app(
         backend = build_backend(settings)
     registry = backend.registry
 
-    # Per-process observability server : the API uses the SAME shared
+    # Per-process observability server: the API uses the SAME shared
     # lifecycle helper as the workers. Disabled unless the observability port
     # (FSP_OBSERVABILITY_PORT, compat fallback FSP_METRICS_PORT) is > 0.
     from fintech_feature_platform.api.runner_daemon import maybe_start_metrics_server
@@ -828,7 +1048,7 @@ def create_app(
                 "fsp_api_request_duration_seconds", _pc() - started,
                 {"route_class": route_class},
             )
-            # Structured request log : bounded route template + outcome only —
+            # Structured request log (Step 3): bounded route template + outcome only —
             # never the raw path/query/body (they can carry IDs and payloads). DEBUG
             # for routine success (final review C: counts/latency live in Prometheus);
             # 5xx responses surface at ERROR so failures stay visible at default INFO.
@@ -853,7 +1073,7 @@ def create_app(
 
     @app.get("/ready")
     def ready(response: Response) -> dict:
-        # READINESS : "can this process perform its role right now?"
+        # READINESS: "can this process perform its role right now?"
         # Role-aware bounded dependency checks over clients built at startup; NEVER
         # queue depth / last-success / throughput (an idle process is ready). 200 when
         # ready, 503 when a required dependency fails; categories only, no secrets.
@@ -1129,7 +1349,7 @@ def create_app(
         # Kafka-first async batch: validate + planner-expand, deterministically chunk the
         # scope, create job status, then publish one BatchChunkRequested per chunk. No
         # synchronous compute; the batch worker computes each chunk. Two scopes: inline
-        # (payloads in the event) and source_dataset_manifest (refs only,).
+        # (payloads in the event) and source_dataset_manifest (refs only, ).
         if request.chunk_size <= 0 or request.chunk_size > settings.batch_max_chunk_size:
             raise HTTPException(
                 status_code=400,
@@ -1137,7 +1357,7 @@ def create_app(
             )
         try:
             view_def = _find_view(backend.registry, request.view, request.view_version)
-            plan_features(
+            plan = plan_features(
                 view_def, request.requested_features, request.requested_feature_groups
             )
         except (PlannerError, ValueError) as exc:
@@ -1156,14 +1376,23 @@ def create_app(
                 for item in request.scope.items
             ]
             manifest_id = None
+            manifest_ids: list[str] = []
         elif request.scope.type == "source_dataset_manifest":
             batch_items, manifest_id = _manifest_batch_items(backend, request)
+            manifest_ids = [manifest_id]
+        elif request.scope.type == "source_dataset_manifests":
+            # Multi-manifest scope: join landed manifests by the COMPLETE
+            # canonical entity key; refs-only items; ambiguity fails closed here.
+            batch_items, manifest_ids = _multi_manifest_batch_items(
+                backend, request, view_def
+            )
+            manifest_id = None
         else:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"unsupported scope type {request.scope.type!r}; expected "
-                    "'inline' or 'source_dataset_manifest'"
+                    "'inline', 'source_dataset_manifest' or 'source_dataset_manifests'"
                 ),
             )
 
@@ -1175,7 +1404,7 @@ def create_app(
         # a far larger cap than inline jobs (whose payloads travel in the Kafka event).
         max_items = (
             settings.batch_max_manifest_items
-            if manifest_id is not None
+            if manifest_ids
             else settings.batch_max_items
         )
         if len(batch_items) > max_items:
@@ -1187,6 +1416,46 @@ def create_app(
         job_id = request.idempotency_key
         now = datetime.now(tz=UTC)
         chunk_size = request.chunk_size
+
+        # Idempotency-key request identity: the same key with a
+        # semantically identical normalized request replays the EXISTING job
+        # unchanged (no status mutation, no re-publish); the same key with a
+        # DIFFERENT normalized request fails closed with 409 before any write.
+        # publish_failed jobs are retryable: an identical resubmission re-runs the
+        # normal create-and-publish flow below.
+        existing = backend.batch_status.get(job_id)
+        if existing is not None and existing.status != "publish_failed":
+            incoming_identity = _batch_request_identity(
+                view=request.view,
+                view_version=request.view_version,
+                requested_outputs=tuple(
+                    (ref.name, ref.version) for ref in plan.requested_outputs
+                ),
+                manifest_id=manifest_id,
+                manifest_ids=manifest_ids,
+                write_online=request.write_online,
+                online_refresh_mode=request.online_refresh_mode,
+                total_items=len(batch_items),
+                chunk_count=-(-len(batch_items) // chunk_size),
+            )
+            if incoming_identity != _existing_job_identity(backend, existing):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"idempotency_key {job_id!r} is already used by a different "
+                        "batch request; reuse the key only for an identical "
+                        "resubmission or choose a new key"
+                    ),
+                )
+            return BatchJobResponse(
+                job_id=existing.job_id,
+                status="accepted",
+                chunk_count=existing.chunk_count,
+                total_items=existing.total_items,
+                manifest_id=existing.manifest_id,
+                manifest_ids=list(existing.manifest_ids),
+            )
+
         chunks = [
             batch_items[i : i + chunk_size]
             for i in range(0, len(batch_items), chunk_size)
@@ -1221,6 +1490,7 @@ def create_app(
                         write_online=request.write_online,
                         total_items=total_items,
                         manifest_id=manifest_id,
+                        manifest_ids=list(manifest_ids),
                     ),
                 )
             )
@@ -1239,6 +1509,8 @@ def create_app(
             requested_feature_groups=request.requested_feature_groups,
             chunks=chunk_statuses,
             manifest_id=manifest_id,
+            manifest_ids=list(manifest_ids),
+            online_refresh_mode=request.online_refresh_mode,
         )
         backend.batch_status.put(job)
 
@@ -1268,6 +1540,7 @@ def create_app(
         return BatchJobResponse(
             job_id=job_id, status="accepted", chunk_count=chunk_count,
             total_items=total_items, manifest_id=manifest_id,
+            manifest_ids=list(manifest_ids),
         )
 
     @app.get("/v1/batch/jobs/{job_id}", dependencies=[operator_auth])

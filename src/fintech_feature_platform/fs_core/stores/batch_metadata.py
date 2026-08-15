@@ -1,4 +1,4 @@
-"""Durable batch job/chunk metadata store (async Postgres audit projection,).
+"""Durable batch job/chunk metadata store (async Postgres audit projection, ).
 
 The Metadata Writer projects ``BatchChunkRequested`` (accepted/requested) and
 ``BatchChunkProcessed`` (completion) into ``batch_jobs`` / ``batch_chunks``. This is a
@@ -114,6 +114,8 @@ class BatchJobRecord:
     finished_at: datetime | None = None
     error_summary: dict = field(default_factory=dict)
     manifest_id: str | None = None  # set for dataset-scoped jobs
+    # ALL input manifests; [] on legacy rows.
+    manifest_ids: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         _require_aware(self.created_at, "created_at")
@@ -137,6 +139,7 @@ class BatchJobRecord:
             "finished_at": _iso(self.finished_at),
             "error_summary": dict(self.error_summary),
             "manifest_id": self.manifest_id,
+            "manifest_ids": list(self.manifest_ids),
         }
 
     @classmethod
@@ -156,6 +159,7 @@ class BatchJobRecord:
             finished_at=_parse_dt(data.get("finished_at")),
             error_summary=dict(data.get("error_summary", {})),
             manifest_id=data.get("manifest_id"),
+            manifest_ids=list(data.get("manifest_ids", [])),
         )
 
 
@@ -221,6 +225,7 @@ def merge_job_snapshot(
         chunk_count=pick(incoming.chunk_count, existing.chunk_count),
         write_online=incoming.write_online or existing.write_online,
         manifest_id=pick(incoming.manifest_id, existing.manifest_id),
+        manifest_ids=list(incoming.manifest_ids or existing.manifest_ids),
         updated_at=now,
     )
 
@@ -297,6 +302,7 @@ _JOB_COLUMNS = (
     "job_id", "status", "feature_view", "view_version", "requested_features_json",
     "requested_feature_groups_json", "total_items", "chunk_count", "write_online",
     "created_at", "updated_at", "finished_at", "error_summary_json", "manifest_id",
+    "manifest_ids",
 )
 _CHUNK_COLUMNS = (
     "chunk_id", "job_id", "chunk_index", "chunk_count", "status", "item_count",
@@ -308,13 +314,14 @@ _UPSERT_JOB_SQL = """
 INSERT INTO batch_jobs (
     job_id, status, feature_view, view_version, requested_features_json,
     requested_feature_groups_json, total_items, chunk_count, write_online,
-    created_at, updated_at, finished_at, error_summary_json, manifest_id
+    created_at, updated_at, finished_at, error_summary_json, manifest_id,
+    manifest_ids
 ) VALUES (
     %(job_id)s, %(status)s, %(feature_view)s, %(view_version)s,
     %(requested_features_json)s::jsonb,
     %(requested_feature_groups_json)s::jsonb, %(total_items)s, %(chunk_count)s,
     %(write_online)s, %(created_at)s, %(updated_at)s, %(finished_at)s,
-    %(error_summary_json)s::jsonb, %(manifest_id)s
+    %(error_summary_json)s::jsonb, %(manifest_id)s, %(manifest_ids_json)s::jsonb
 )
 ON CONFLICT (job_id) DO UPDATE SET
     status = EXCLUDED.status, feature_view = EXCLUDED.feature_view,
@@ -324,7 +331,8 @@ ON CONFLICT (job_id) DO UPDATE SET
     total_items = EXCLUDED.total_items, chunk_count = EXCLUDED.chunk_count,
     write_online = EXCLUDED.write_online, updated_at = EXCLUDED.updated_at,
     finished_at = EXCLUDED.finished_at, error_summary_json = EXCLUDED.error_summary_json,
-    manifest_id = EXCLUDED.manifest_id
+    manifest_id = EXCLUDED.manifest_id,
+    manifest_ids = COALESCE(EXCLUDED.manifest_ids, batch_jobs.manifest_ids)
 """
 
 _UPSERT_CHUNK_SQL = """
@@ -363,6 +371,7 @@ def _job_to_params(job: BatchJobRecord) -> dict[str, Any]:
         "updated_at": job.updated_at, "finished_at": job.finished_at,
         "error_summary_json": json.dumps(job.error_summary, sort_keys=True),
         "manifest_id": job.manifest_id,
+        "manifest_ids_json": json.dumps(list(job.manifest_ids)) if job.manifest_ids else None,
     }
 
 
@@ -393,6 +402,7 @@ def _row_to_job(row: Mapping[str, Any]) -> BatchJobRecord:
         write_online=row["write_online"], finished_at=row["finished_at"],
         error_summary=dict(_loads(row["error_summary_json"]) or {}),
         manifest_id=row.get("manifest_id"),
+        manifest_ids=list(row.get("manifest_ids") or []),
     )
 
 

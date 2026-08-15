@@ -5,7 +5,7 @@ upserts the ``feature_requests`` snapshot and appends a ``request_events`` audit
 It stores **no feature values, no raw payloads, and no DLQ ``source_payload_b64``** — only
 references and small summaries.
 
-Failure classification (; the architecture documentation poison discipline):
+Failure classification:
 deterministic audit conflicts (``RawReportMetaConflictError`` /
 ``BatchMetadataConflictError``) surface as ``structural_conflict`` — the runner
 dead-letters them and commits, so they can never replay-loop and halt the partition.
@@ -123,7 +123,7 @@ def _project_requested(
                 created_at=now,
                 format=descriptor.format,
                 compression=descriptor.compression,
-                # Online descriptors carry the API accept time — platform
+                # 0075B: online descriptors carry the API accept time — platform
                 # acceptance, never a client-supplied historical claim.
                 available_at=descriptor.available_at,
                 availability_source=(
@@ -141,7 +141,7 @@ def _project_completed(
     event = FeatureComputeCompleted.from_dict(data)
     now = datetime.now(tz=UTC)
     # Project the event's own online_write_status (written / skipped_stale / noop /
-    # deadline_expired); legacy events (legacy) omit it and mean a successful write.
+    # deadline_expired); legacy events (pre-0054) omit it and mean a successful write.
     online_write_status = event.online_write_status or "written"
     store.upsert_request(
         RequestMetadata(
@@ -318,6 +318,7 @@ def _project_batch_chunk_requested(
             requested_feature_groups=list(event.requested_feature_groups),
             total_items=event.total_items, chunk_count=event.chunk_count,
             write_online=event.write_online, manifest_id=event.manifest_id,
+            manifest_ids=list(event.manifest_ids),
         )
     )
     batch_meta.upsert_chunk_requested(
