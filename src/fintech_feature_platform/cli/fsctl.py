@@ -368,6 +368,49 @@ def _cmd_image_context(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- ingest / materialize / build-training-dataset -------------
+# Thin adapters over the public HTTP API; stdlib-only, lazily imported so the
+# artifact/registry verbs never depend on the data-workflow module.
+
+def _cmd_ingest(args: argparse.Namespace) -> int:
+    from fintech_feature_platform.cli.data_workflow import ApiClientError, run_ingest
+
+    try:
+        payload, code = run_ingest(args)
+    except ApiClientError as exc:
+        _print({"ok": False, "errors": [str(exc)]})
+        return 1
+    _print(payload)
+    return code
+
+
+def _cmd_materialize(args: argparse.Namespace) -> int:
+    from fintech_feature_platform.cli.data_workflow import ApiClientError, run_materialize
+
+    try:
+        payload, code = run_materialize(args)
+    except ApiClientError as exc:
+        _print({"ok": False, "errors": [str(exc)]})
+        return 1
+    _print(payload)
+    return code
+
+
+def _cmd_build_training_dataset(args: argparse.Namespace) -> int:
+    from fintech_feature_platform.cli.data_workflow import (
+        ApiClientError,
+        run_build_training_dataset,
+    )
+
+    try:
+        payload, code = run_build_training_dataset(args)
+    except ApiClientError as exc:
+        _print({"ok": False, "errors": [str(exc)]})
+        return 1
+    _print(payload)
+    return code
+
+
 # --- promote -----------------------------------------------------------------
 
 def _cmd_promote(args: argparse.Namespace) -> int:
@@ -470,7 +513,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pub.add_argument("--registry", default=None)
     p_pub.add_argument("--bundle-store", default=None)
     p_pub.add_argument("--source-ref", default=None)
-    # Artifact-bound publish : build/hash/isolated-test a feature wheel and bind
+    # Artifact-bound publish: build/hash/isolated-test a feature wheel and bind
     # it to the bundle. With --project the registry/tests/provider come from
     # feature_project.yaml; --wheel reuses a prebuilt wheel instead of building.
     p_pub.add_argument("--project", default=None, help="Feature Project dir (artifact-bound)")
@@ -502,6 +545,75 @@ def _build_parser() -> argparse.ArgumentParser:
     p_rb.add_argument("--actor", required=True)
     p_rb.add_argument("--reason", required=True)
     p_rb.set_defaults(func=_cmd_rollback)
+
+    # Data-workflow verbs: public HTTP API adapters. The API URL
+    # comes from --api-url > CLEARFEATURE_API_URL > FSP_API_URL > localhost; the
+    # operator key ONLY from CLEARFEATURE_API_KEY / FSP_CLIENT_API_KEY (env).
+    def _add_api_flags(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--api-url", default=None,
+                       help="API base URL (default: $CLEARFEATURE_API_URL or $FSP_API_URL "
+                            "or http://127.0.0.1:8000)")
+        p.add_argument("--http-timeout-seconds", type=float, default=60.0,
+                       help="per-request HTTP timeout")
+
+    p_ing = sub.add_parser(
+        "ingest", help="upload canonical JSONL raw reports; returns one source-dataset manifest"
+    )
+    p_ing.add_argument("--entity-type", required=True)
+    p_ing.add_argument("--source-name", required=True)
+    p_ing.add_argument("--report-type", required=True)
+    p_ing.add_argument("--input", required=True,
+                       help="canonical JSONL file (one report row per line)")
+    p_ing.add_argument("--dataset-id", default=None, help="optional client dataset id")
+    p_ing.add_argument("--created-by", default=None)
+    p_ing.add_argument("--output", default=None,
+                       help="write the full manifest response JSON to this file")
+    _add_api_flags(p_ing)
+    p_ing.set_defaults(func=_cmd_ingest)
+
+    p_mat = sub.add_parser(
+        "materialize",
+        help="submit one multi-manifest batch job (scope=source_dataset_manifests)",
+    )
+    p_mat.add_argument("--view", required=True)
+    p_mat.add_argument("--view-version", required=True, type=int)
+    p_mat.add_argument("--manifest-id", action="append", required=True, dest="manifest_ids",
+                       help="source-dataset manifest id (repeat per landed source)")
+    p_mat.add_argument("--feature", action="append", default=None, dest="features",
+                       help="requested feature name (repeatable)")
+    p_mat.add_argument("--feature-group", action="append", default=None, dest="feature_groups",
+                       help="requested feature group (repeatable)")
+    p_mat.add_argument("--chunk-size", type=int, default=100,
+                       help="items per batch chunk (server cap applies)")
+    p_mat.add_argument("--write-online", action="store_true")
+    p_mat.add_argument("--online-refresh-mode", choices=["guarded"], default=None)
+    p_mat.add_argument("--idempotency-key", default=None,
+                       help="explicit job identity (default: derived from the request)")
+    p_mat.add_argument("--wait", action="store_true",
+                       help="poll job status to a terminal state")
+    p_mat.add_argument("--timeout-seconds", type=float, default=600.0,
+                       help="--wait deadline; the job keeps running server-side on timeout")
+    p_mat.add_argument("--poll-interval-seconds", type=float, default=2.0)
+    _add_api_flags(p_mat)
+    p_mat.set_defaults(func=_cmd_materialize)
+
+    p_train = sub.add_parser(
+        "build-training-dataset",
+        help="build a PIT-safe training dataset from an observations JSONL file",
+    )
+    p_train.add_argument("--view", required=True)
+    p_train.add_argument("--view-version", required=True, type=int)
+    p_train.add_argument("--feature", action="append", required=True, dest="features",
+                         help="requested feature name (repeatable)")
+    p_train.add_argument("--observations", required=True,
+                         help="JSONL file: {entity, observation_ts[, context]} per line")
+    p_train.add_argument("--safety-gap-seconds", type=int, default=0)
+    p_train.add_argument("--missing-policy", choices=["keep_null", "error"],
+                         default="keep_null")
+    p_train.add_argument("--output", required=True,
+                         help="write the full training-dataset response JSON to this file")
+    _add_api_flags(p_train)
+    p_train.set_defaults(func=_cmd_build_training_dataset)
 
     p_img = sub.add_parser(
         "image-context",

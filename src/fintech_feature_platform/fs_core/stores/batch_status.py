@@ -99,6 +99,11 @@ class BatchJobStatus:
     finished_at: datetime | None = None
     error_summary: dict = field(default_factory=dict)
     manifest_id: str | None = None  # set for dataset-scoped jobs
+    # ALL input manifests: singular manifest_id kept for compatibility.
+    manifest_ids: list[str] = field(default_factory=list)
+    # Online refresh policy the job was accepted with: part of the
+    # idempotency-key request identity. Additive; older snapshots read as None.
+    online_refresh_mode: str | None = None
 
     def __post_init__(self) -> None:
         _require_aware(self.created_at, "created_at")
@@ -139,6 +144,8 @@ class BatchJobStatus:
             "finished_at": _iso(self.finished_at),
             "error_summary": dict(self.error_summary),
             "manifest_id": self.manifest_id,
+            "manifest_ids": list(self.manifest_ids),
+            "online_refresh_mode": self.online_refresh_mode,
         }
 
     def to_json(self) -> bytes:
@@ -165,6 +172,8 @@ class BatchJobStatus:
             finished_at=_parse_dt(data.get("finished_at")),
             error_summary=dict(data.get("error_summary", {})),
             manifest_id=data.get("manifest_id"),
+            manifest_ids=list(data.get("manifest_ids", [])),
+            online_refresh_mode=data.get("online_refresh_mode"),
         )
 
     @classmethod
@@ -192,7 +201,7 @@ def merge_chunk(job: BatchJobStatus, chunk: BatchChunkStatus) -> BatchJobStatus:
 
     Job progress derives from unique chunk terminal states, never delivery counts, so a
     duplicate delivery cannot double-count. A terminal chunk never regresses to a
-    non-terminal state: with chunk-keyed events  a redelivered chunk
+    non-terminal state: with chunk-keyed events a redelivered chunk
     (crash-before-commit, rebalance window) is reprocessed starting with a late
     ``running`` update, which must not un-finish an already finished chunk.
     """
@@ -256,7 +265,7 @@ def batch_job_key(job_id: str) -> str:
 class ValkeyBatchJobStatusStore:
     """Valkey-backed batch status store (shared across processes), TTL-bounded.
 
-    ``set_chunk`` is an optimistic WATCH/MULTI transaction : with
+    ``set_chunk`` is an optimistic WATCH/MULTI transaction: with
     chunk-keyed batch events, several workers finish chunks of the SAME job
     concurrently, and a plain read-modify-write would lose updates (a chunk stuck at
     ``accepted`` forever). ``redis``'s ``transaction()`` retries the merge when another

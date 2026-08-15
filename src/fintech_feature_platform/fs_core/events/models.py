@@ -2,7 +2,7 @@
 
 The online compute event must be *self-contained*: a worker can locate and read the
 raw reports from object storage using the report descriptors alone, without querying
-Postgres. Events carry references and metadata only — never raw payloads.
+Postgres (ADR-0002). Events carry references and metadata only — never raw payloads.
 
 These are boring stdlib dataclasses with deterministic JSON (``sort_keys=True``) so
 tests can assert exact serialization. ``object_key`` is internal event metadata; the
@@ -91,9 +91,9 @@ class ReportDescriptor:
     size_bytes: int
     compression: str
     format: str
-    # Availability clock : stamped by the producer (API accept time for
+    # Availability clock: stamped by the producer (API accept time for
     # online requests; trusted/ingestion-time meta for batch refs). Optional and
-    # tolerant-parsed so legacy events replay unchanged.
+    # tolerant-parsed so pre-0075B events replay unchanged.
     available_at: datetime | None = None
 
     def to_dict(self) -> dict:
@@ -139,7 +139,7 @@ class FeatureComputeRequested:
 
     Published to ``fp.feature-compute.online``. Consumed by online workers.
 
-    Deadline fields : ``event_ts`` is when the API accepted/published the
+    Deadline fields: ``event_ts`` is when the API accepted/published the
     request; ``expires_at`` is the absolute deadline after which an online compute
     result must not write Valkey (the online worker skips the write and records a
     ``deadline_expired`` outcome). Both are optional for backward compatibility — an
@@ -239,10 +239,10 @@ class FeatureComputeCompleted:
     values or raw payloads. The values-bearing offline-write event (for the Offline
     Writer) is deliberately deferred to a later task.
 
-    ``online_write_status``  records the aggregate D9 outcome of the online
+    ``online_write_status`` records the aggregate D9 outcome of the online
     write (``written`` / ``skipped_stale`` / ``noop``) or ``deadline_expired`` when the
     request expired before its online write. It lets the Metadata Writer audit "expired
-    before online write" without any feature values. Legacy events (legacy) omit it;
+    before online write" without any feature values. Legacy events (pre-0054) omit it;
     consumers treat a missing value as ``written``.
     """
 
@@ -301,8 +301,8 @@ class FeatureComputeCompleted:
 class FeatureUpdated:
     """A values-free announcement that one feature was durably written for one entity.
 
-    Published to ``fp.feature-updates`` after a durable offline write/import. It
-    carries references, freshness timestamps, and D9 hash ids only — never
+    Published to ``fp.feature-updates`` after a durable offline write/import.
+    It carries references, freshness timestamps, and D9 hash ids only — never
     a feature value, raw payload, ``object_key``/``storage_uri``, DWH row body, or SQL. The
     reactive propagation worker uses it to plan debounced recompute waves for reactive
     dependents.
@@ -556,9 +556,9 @@ class ModelScoreWriteRequested:
 class BatchItem:
     """One entity for a batch chunk, sourced one of two ways (never both):
 
-    - ``inline_sources`` (inline batch,): ``api.direct_compute.InlineSource``
+    - ``inline_sources`` (inline batch, ): ``api.direct_compute.InlineSource``
       shape as plain dicts (``{source_name: {report_type, report_ts(iso), payload}}``);
-    - ``source_refs`` (dataset-scoped,): ``{source_name: report_ref}`` — the
+    - ``source_refs`` (dataset-scoped, ): ``{source_name: report_ref}`` — the
       report is already landed, so the chunk event carries a **reference only**, never a
       payload/object_key. The worker resolves it via ``raw_reports_meta`` + payload store.
     """
@@ -614,6 +614,9 @@ class BatchChunkRequested:
     write_online: bool = False
     total_items: int = 0  # job-wide item count (so audit job snapshot is complete)
     manifest_id: str | None = None  # set for dataset-scoped jobs
+    # ALL input manifests. Additive: singular
+    # manifest_id stays for backward compatibility; old events parse with [].
+    manifest_ids: list[str] = field(default_factory=list)
     event_type: str = EVENT_TYPE_BATCH_CHUNK_REQUESTED
     event_version: int = EVENT_VERSION
 
@@ -635,6 +638,7 @@ class BatchChunkRequested:
             "write_online": self.write_online,
             "total_items": self.total_items,
             "manifest_id": self.manifest_id,
+            "manifest_ids": list(self.manifest_ids),
         }
 
     def to_json(self) -> bytes:
@@ -657,6 +661,7 @@ class BatchChunkRequested:
             write_online=data.get("write_online", False),
             total_items=data.get("total_items", 0),
             manifest_id=data.get("manifest_id"),
+            manifest_ids=list(data.get("manifest_ids", [])),
             event_type=data.get("event_type", EVENT_TYPE_BATCH_CHUNK_REQUESTED),
             event_version=data.get("event_version", EVENT_VERSION),
         )
@@ -824,7 +829,7 @@ class DeadLetterEvent:
             original_correlation_id=data.get("original_correlation_id"),
             attempt_count=data.get("attempt_count"),
             max_attempts=data.get("max_attempts"),
-            # Optional: absent in legacy DLQ events (tolerant parse).
+            # Optional: absent in pre-0055 DLQ events (tolerant parse).
             original_event_type=data.get("original_event_type"),
             event_type=data.get("event_type", EVENT_TYPE_DLQ),
             event_version=data.get("event_version", EVENT_VERSION),
@@ -844,7 +849,7 @@ def build_idempotency_key(
     """Deterministic idempotency key for the logical compute request.
 
     Covers the entity, the requested outputs, and the exact report contents, so an
-    identical resubmission yields the same key.
+    identical resubmission yields the same key (ADR-0004 idempotency intent).
     """
     digest_src = json.dumps(
         {

@@ -4,19 +4,19 @@ This document defines the target API contracts for the Kafka-first MVP.
 
 These contracts are implementation targets. Not every endpoint must be implemented in the first task, but new implementation work must not introduce APIs that contradict this document.
 
-## Current as-built contract (read this first)
+## Current as-built contract
 
 Everything below in this file predates authentication and the availability clock;
 where it conflicts, the following rules and the executable inventory win
 (`ENDPOINT_POLICY` in `api/app.py` / `examples/.../model_service.py`, exported in the
-audit):
+0075A audit):
 
-- **Observability endpoints **: `GET /health` (liveness), `GET /ready`
+- **Observability endpoints**: `GET /health` (liveness), `GET /ready`
   (role readiness, 200/503, bounded categories only), per-process `GET /metrics`
   (Prometheus text on `FSP_OBSERVABILITY_PORT`; legacy fallback `FSP_METRICS_PORT`),
   and the legacy operator JSON snapshot `GET /v1/observability/metrics`. Contract:
   `docs/21_observability_contract.md`.
-- **Online deadline & retry contract **: `deadline_ms` (default **1000**, clamped
+- **Online deadline & retry contract**: `deadline_ms` (default **1000**, clamped
   to `FSP_ONLINE_MAX_DEADLINE_MS` = 60000) becomes an absolute `expires_at` stamped on
   the event; workers reason only from `expires_at`. A request finishing as
   `deadline_expired` performed **no compute and no online/offline write**; the event
@@ -29,7 +29,7 @@ audit):
   keeps it short). Recommended client pattern: bounded retries with backoff, e.g.
   3 attempts at 0 s / 1 s / 5 s, treating `deadline_expired` (and only it) as
   retryable-by-design. Do NOT blindly retry generic HTTP 500s.
-- **Authentication **: every endpoint except the public probes `GET /health` and
+- **Authentication**: every endpoint except the public probes `GET /health` and
   `GET /ready` requires
   `Authorization: Bearer <api-key>`. Roles: `service` (feature reads/consistency,
   feature-request submit/compute/status, model scores, credit decision) and
@@ -47,7 +47,7 @@ audit):
   this document means the Kafka-compatible protocol (topics, consumer groups,
   at-least-once delivery); the deployed broker is **Redpanda** — there is no Apache
   Kafka container.
-- **Time contract **: four clocks —
+- **Time contract**: four clocks —
   `report_ts` (business/as-of, required), `available_at` (availability to the bank:
   optional trusted field on operator ingestion rows and inline batch sources;
   **server-stamped accept time** on online requests — service callers cannot
@@ -55,13 +55,13 @@ audit):
   `data_ts <= obs - safety_gap AND COALESCE(available_at, calc_ts) <= obs`.
   Lineage answers `available_at` / `availability_source` /
   `availability_effective`, values-free.
-- **Status truthfulness **: `metadata_write_status` transitions
+- **Status truthfulness**: `metadata_write_status` transitions
   `pending → written` once the metadata writer durably commits the request's
   terminal projection. **PostgreSQL is the durable source of truth; Valkey is
   operational and may lag** — `GET /v1/feature-requests/{id}` reconciles a pending
   status against the durable projection and read-repairs monotonically, so a lost
   operational update can never leave a permanent false `pending`.
-- **Availability corrections are audited **: every accepted trusted
+- **Availability corrections are audited**: every accepted trusted
   `available_at` correction writes one append-only row to
   `raw_report_availability_changes` (old/new values + provenance + origin ids),
   atomically with the metadata update; replays add nothing.
@@ -69,6 +69,15 @@ audit):
   `rejected` + error); structurally poison Kafka messages go to the non-lossy
   `fp.dlq` topic; per-item batch failures land in
   `batch_chunks.first_errors_json`.
+- **Public CLI adapters**: `fsctl ingest` →
+  `POST /v1/source-datasets/ingest-jsonl`; `fsctl materialize` →
+  `POST /v1/batch/jobs` with `scope.type=source_dataset_manifests` (+ optional
+  polling of `GET /v1/batch/jobs/{job_id}`); `fsctl build-training-dataset` →
+  `POST /v1/training-datasets/build`. Thin transport adapters only — request/
+  response shapes are exactly these endpoints' contracts; auth is the same
+  operator Bearer key (env: `CLEARFEATURE_API_KEY`, fallback
+  `FSP_CLIENT_API_KEY`). Full CLI walkthrough:
+  `docs/20_feature_project_quickstart.md`.
 
 ## Core Rules
 
@@ -120,22 +129,25 @@ Request example with inline reports:
     "user_id": "123",
     "application_id": "A1"
   },
+  "view": "pd_model_input",
+  "view_version": 1,
+  "requested_features": [],
   "requested_feature_groups": [
     "pd_model_input_v1"
   ],
   "reports": [
     {
       "source_name": "bureau",
-      "schema_version": "v1",
-      "report_ts": "2026-06-27T10:00:00Z",
+      "report_type": "bureau",
+      "report_ts": "2026-06-27T10:00:00+00:00",
       "payload": {
         "example": "large bureau report"
       }
     },
     {
       "source_name": "application_form",
-      "schema_version": "v1",
-      "report_ts": "2026-06-27T10:00:05Z",
+      "report_type": "application_form",
+      "report_ts": "2026-06-27T10:00:05+00:00",
       "payload": {
         "age": 35,
         "region": "Tashkent"
@@ -149,32 +161,23 @@ Request example with inline reports:
 }
 ```
 
-Request example with existing reports:
+Sent with the operator/service Bearer key (all feature-request endpoints require
+`Authorization: Bearer <api-key>`; see the as-built authentication section at the
+top of this document):
 
-```json
-{
-  "entity_type": "application",
-  "entity_key": {
-    "user_id": "123",
-    "application_id": "A1"
-  },
-  "requested_feature_groups": [
-    "pd_model_input_v1"
-  ],
-  "reports": [
-    {
-      "report_ref": "rep_bureau_123"
-    },
-    {
-      "report_ref": "rep_application_form_456"
-    }
-  ],
-  "write_policy": "online_first",
-  "priority": "online",
-  "deadline_ms": 1000,
-  "idempotency_key": "application:A1:pd_model_input_v1:request_hash"
-}
+```bash
+curl -s -X POST "$CLEARFEATURE_API_URL/v1/feature-requests" \
+  -H "Authorization: Bearer $CLEARFEATURE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d @request.json
 ```
+
+Every request names `view` + `view_version`, and every report carries
+`source_name`, `report_type`, a **timezone-aware** `report_ts`, and its inline
+`payload` (`schema_version` defaults to `"v1"`; an optional caller-supplied
+`report_ref` may be attached to a report for stable identity). Ref-only report
+reuse is NOT part of the current contract — the legacy `/v1/raw-reports` +
+ref-reuse subsystem was removed in ; online reports are always inline.
 
 Response example:
 
@@ -257,14 +260,17 @@ Request example:
     "user_id": "123",
     "application_id": "A1"
   },
+  "view": "pd_model_input",
+  "view_version": 1,
+  "requested_features": [],
   "requested_feature_groups": [
     "pd_model_input_v1"
   ],
   "reports": [
     {
       "source_name": "bureau",
-      "schema_version": "v1",
-      "report_ts": "2026-06-27T10:00:00Z",
+      "report_type": "bureau",
+      "report_ts": "2026-06-27T10:00:00+00:00",
       "payload": {
         "example": "large bureau report"
       }
@@ -277,6 +283,12 @@ Request example:
   "idempotency_key": "application:A1:pd_model_input_v1:request_hash"
 }
 ```
+
+The request model is `/v1/feature-requests` plus `wait_timeout_ms`; the same
+`Authorization: Bearer <api-key>` header and the same per-report requirements
+(`source_name`, `report_type`, timezone-aware `report_ts`, inline `payload`)
+apply. The live-qualified end-to-end example for this endpoint is quickstart §12
+(`docs/20_feature_project_quickstart.md`).
 
 Completed response example:
 
@@ -588,9 +600,16 @@ sources (same shape as `/v1/features` inline sources). The API validates `view`/
 + planner-expands `requested_features`/`requested_feature_groups`, deterministically slices
 `scope.items` into chunks (`chunk_id = {job_id}:{index}`), creates a job status, and publishes
 one `BatchChunkRequested` per chunk to `fp.feature-compute.batch`. **No synchronous compute.**
-`idempotency_key` is required and becomes `job_id`. Offline write is **always** on
-(offline-first); `write_online` is optional (default false). `chunk_size` is capped by
-`FSP_BATCH_MAX_CHUNK_SIZE`; total items by `FSP_BATCH_MAX_ITEMS`.
+`idempotency_key` is required and becomes `job_id`. **Idempotency-key request identity
+:** resubmitting the same key with a semantically identical normalized request
+(same scope category + manifest provenance, view identity, planner-expanded requested
+outputs, online write/refresh policy, and realized chunking) returns the EXISTING job
+unchanged — nothing is re-published and no status is mutated; the same key with a
+DIFFERENT normalized request fails closed with **409** before any write or publish
+(`publish_failed` jobs are retryable with an identical resubmission). Offline write is
+**always** on (offline-first); `write_online` is optional (default false). `chunk_size` is capped by
+`FSP_BATCH_MAX_CHUNK_SIZE`; total items by `FSP_BATCH_MAX_ITEMS` for the inline
+scope and by `FSP_BATCH_MAX_MANIFEST_ITEMS` for both manifest scopes.
 
 Request example (V1):
 
@@ -637,8 +656,55 @@ The batch worker computes each chunk item via the shared `persist_and_compute` (
 `ComputeCore` semantics as online), with per-item error accounting; it commits the chunk
 offset only after processing (structural/invalid → DLQ; infra failure → replay).
 
-**Deferred:** `report_refs`/date-range/object-store/SQL scopes; job types beyond inline
-feature compute; a durable Postgres job/chunk projection; `write_offline=false`.
+**Manifest scopes (landed data, refs-only).** Two scope types compute over reports already
+landed via `/v1/source-datasets/*` — Kafka carries `report_ref`s only, never payloads:
+
+* `source_dataset_manifest` — one manifest; each written item becomes one single-ref
+  `BatchItem`.
+* `source_dataset_manifests` — several manifests, one per source, joined
+  server-side into multi-ref items:
+
+```json
+{
+  "view": "credit_model_inputs",
+  "view_version": 1,
+  "requested_feature_groups": ["model_inputs"],
+  "scope": {
+    "type": "source_dataset_manifests",
+    "manifest_ids": ["sdm_credit...", "sdm_socdem..."]
+  },
+  "chunk_size": 100,
+  "idempotency_key": "materialize-2026-05-01"
+}
+```
+
+Join rule: items are grouped by the **complete canonical entity key** in the view's
+`key_fields` order (never a key subset, and equal `report_ts` across sources is NOT
+required). Each source keeps its own `report_ts`/`available_at`, so D3/D9 derive
+`data_ts`/`max_input_data_ts`/`available_at` from the individual source stamps. The result
+is deterministic regardless of `manifest_ids` order. Fail-closed validation (all `400`,
+values-free, nothing published): empty/duplicate `manifest_ids`, manifest not found (`404`),
+non-`raw_reports` landing form, source not in the registry, mixed `entity_type` across
+manifests, and **ambiguous bindings** (the same entity + source bound to distinct
+`report_ref`s); exact duplicate refs collapse. Every raw source in the planned
+requested-output DAG closure is mandatory per entity: an entity missing one is
+still submitted and surfaces as the deterministic per-item error
+`no report_ref bound for source '<name>'` (unaffected entities continue; job may finish
+`completed_with_errors`). There is no boolean partial-materialization switch — partial
+materialization, if ever introduced, needs an explicit output/error contract; the
+platform never silently drops requested outputs or fabricates nulls. Provenance: the accepted
+response, job status, and the durable Postgres `batch_jobs.manifest_ids` projection all
+carry the full `manifest_ids` list (the singular scope keeps `manifest_id` and, as
+built, also reports `manifest_ids=[manifest_id]`).
+`fsctl materialize` submits exactly this scope shape and derives a stable
+`idempotency_key` from the normalized request when not supplied
+(`docs/20_feature_project_quickstart.md`). `include_duplicate_items` is a
+singular-scope option only: an explicit `true` on `source_dataset_manifests` is
+rejected with a bounded 400 before any job or publish (the multi-manifest join always
+collapses exact-duplicate re-ingested bindings — ).
+
+**Deferred:** `report_refs`/date-range/object-store/SQL scopes; job types beyond
+feature compute; `write_offline=false`.
 
 ---
 
@@ -774,9 +840,9 @@ These APIs are deferred. Do not build a UI or complex admin surface in the MVP i
 **Removed.** The legacy synchronous compute routes no longer exist:
 
 ```text
-POST /v1/raw-reports             # removed  — use POST /v1/feature-requests
-POST /v1/features/compute        # removed  — use the Kafka-first request API
-POST /v1/features/compute-direct # removed  — use the Kafka-first request API
+POST /v1/raw-reports             # removed — use POST /v1/feature-requests
+POST /v1/features/compute        # removed — use the Kafka-first request API
+POST /v1/features/compute-direct # removed — use the Kafka-first request API
 ```
 
 Online compute is Kafka-first only (`POST /v1/feature-requests[/compute]`). The inline
