@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/Logo_ClearFeature.png" alt="ClearFeature logo" width="400">
+</p>
+
 # ClearFeature
 
 **ClearFeature is a lightweight, open-core feature platform for credit-risk, fraud,
