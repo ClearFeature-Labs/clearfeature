@@ -4,10 +4,7 @@
 
 # ClearFeature
 
-**ClearFeature is a lightweight, open-core feature platform for credit-risk, fraud,
-scoring and decision systems. Define feature logic once in Python, declare the DAG
-once in YAML, and run the same tested feature code in historical batch, PIT-safe
-training datasets, and online inference.**
+**ClearFeature is a transparent, lightweight, open-core feature platform for batch, point-in-time, and online feature computation. Define feature logic in Python, declare dependencies as a DAG in YAML, and run the same tested code across historical batch computation, point-in-time-correct training datasets, and request-time online computation.**
 
 > **One feature definition. One DAG. Same logic for training and inference.**
 
